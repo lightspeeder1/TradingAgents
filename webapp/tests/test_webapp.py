@@ -88,6 +88,57 @@ class ApiTests(unittest.TestCase):
         self.assertIn("ollama_local", response.text)
         self.assertIn("lm_studio_local", response.text)
         self.assertIn("vllm_local", response.text)
+        self.assertIn("testEndpointButton", response.text)
+
+    def test_endpoint_test_probes_selected_local_compatible_server(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        class ModelsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/v1/models":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"data":[]}')
+
+            def log_message(self, format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ModelsHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = self.client.post("/api/test-endpoint", json={
+                "provider": "openai_compatible",
+                "backend_url": f"http://127.0.0.1:{server.server_port}/v1",
+            })
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertIn("HTTP 200", response.json()["message"])
+
+    def test_endpoint_probe_rejects_custom_url_for_hosted_provider(self):
+        with patch("webapp.app.urlopen") as mocked_open:
+            response = self.client.post("/api/test-endpoint", json={
+                "provider": "openrouter",
+                "backend_url": "http://127.0.0.1:9000/v1",
+            })
+        self.assertEqual(response.status_code, 422)
+        mocked_open.assert_not_called()
+
+    def test_endpoint_probe_rejects_malformed_port(self):
+        response = self.client.post("/api/test-endpoint", json={
+            "provider": "openai_compatible",
+            "backend_url": "http://127.0.0.1:notaport/v1",
+        })
+        self.assertEqual(response.status_code, 422)
 
     def test_worker_finishes_run_and_persists_report(self):
         class FakeGraph:

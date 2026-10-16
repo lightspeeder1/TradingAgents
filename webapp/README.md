@@ -18,6 +18,7 @@ Set your provider credentials in the repository `.env` (or the environment) befo
 ## What is included
 
 - Ticker/date validation, analyst selection, model/provider selection, language and debate settings.
+- A “Test endpoint” check that queries the selected provider’s model-list endpoint without sending a model prompt or consuming generation tokens; local/custom URLs are checked through the OpenAI-compatible API.
 - SQLite-backed run history at `~/.tradingagents/web/runs.sqlite3`.
 - One background worker and polling progress updates.
 - LangGraph checkpointing by default; the engine clears a checkpoint after a successful run.

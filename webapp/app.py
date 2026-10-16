@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import os
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel
 
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
+from tradingagents.llm_clients.openai_client import OPENAI_COMPATIBLE_PROVIDERS
 
 from .service import JobService, RunRequest, configured_default_models, configured_default_provider
 
@@ -19,6 +25,105 @@ ANALYSTS = [
     {"id": "news", "label": "News", "detail": "Company & macro events"},
     {"id": "fundamentals", "label": "Fundamentals", "detail": "Financials & valuation"},
 ]
+
+
+class EndpointTestRequest(BaseModel):
+    provider: str
+    backend_url: str | None = None
+
+
+def _endpoint_test_target(provider: str, backend_url: str | None) -> tuple[str, dict[str, str]]:
+    """Resolve a provider's non-generative model-list endpoint and auth headers."""
+    provider = provider.strip().lower()
+    if provider not in PROVIDER_API_KEY_ENV:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+    if backend_url and provider not in {"ollama", "openai_compatible"}:
+        raise ValueError("Use the OpenAI-compatible provider for a custom endpoint; hosted provider credentials will not be sent to custom URLs.")
+
+    headers = {"Accept": "application/json"}
+    if provider in OPENAI_COMPATIBLE_PROVIDERS:
+        spec = OPENAI_COMPATIBLE_PROVIDERS[provider]
+        base_url = backend_url or (
+            os.environ.get(spec.base_url_env) if spec.base_url_env else None
+        ) or spec.base_url
+        if not base_url and provider == "openai":
+            base_url = "https://api.openai.com/v1"
+        if not base_url:
+            raise ValueError("Enter a base URL for this OpenAI-compatible endpoint.")
+        api_key_env = PROVIDER_API_KEY_ENV.get(provider)
+        api_key = os.environ.get(api_key_env) if api_key_env else None
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return f"{base_url.rstrip('/')}/models", headers
+
+    if provider == "anthropic":
+        base_url = backend_url or "https://api.anthropic.com"
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+        suffix = "/models" if base_url.rstrip("/").endswith("/v1") else "/v1/models"
+        return f"{base_url.rstrip('/')}{suffix}", headers
+
+    if provider == "google":
+        base_url = backend_url or "https://generativelanguage.googleapis.com"
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if api_key:
+            headers["x-goog-api-key"] = api_key
+        return f"{base_url.rstrip('/')}/v1beta/models", headers
+
+    if provider == "azure":
+        base_url = backend_url or os.environ.get("AZURE_OPENAI_ENDPOINT")
+        if not base_url:
+            raise ValueError("Set AZURE_OPENAI_ENDPOINT or enter an endpoint URL first.")
+        api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        if api_key:
+            headers["api-key"] = api_key
+        version = os.environ.get("OPENAI_API_VERSION", "2024-10-21")
+        return f"{base_url.rstrip('/')}/openai/models?api-version={version}", headers
+
+    if provider == "bedrock":
+        raise ValueError("Bedrock endpoint testing uses AWS credentials; this probe supports HTTP endpoints only.")
+
+    raise ValueError(f"Endpoint testing is not configured for provider: {provider}")
+
+
+def probe_endpoint(provider: str, backend_url: str | None) -> dict[str, object]:
+    """Check endpoint reachability without sending a model prompt or spending tokens."""
+    if backend_url:
+        supplied = urlsplit(backend_url)
+        if (supplied.scheme not in ("http", "https") or not supplied.hostname
+                or supplied.username or supplied.password or supplied.query or supplied.fragment):
+            raise ValueError("Endpoint must be an http:// or https:// base URL without credentials, query, or fragment.")
+        try:
+            supplied.port
+        except ValueError as exc:
+            raise ValueError("Endpoint URL has an invalid port.") from exc
+    target, headers = _endpoint_test_target(provider, backend_url)
+    parsed = urlsplit(target)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Resolved provider endpoint is not a valid http:// or https:// URL.")
+
+    request = UrlRequest(target, headers=headers, method="GET")
+    try:
+        with urlopen(request, timeout=4) as response:
+            status = response.status
+    except HTTPError as exc:
+        status = exc.code
+    except (URLError, TimeoutError, OSError):
+        return {"ok": False, "reachable": False, "status_code": None,
+                "message": "Could not connect. Confirm the endpoint URL and that its service is running."}
+
+    if 200 <= status < 300:
+        return {"ok": True, "reachable": True, "status_code": status,
+                "message": f"Endpoint is responding (HTTP {status})."}
+    if status in (401, 403):
+        message = f"Endpoint is reachable but rejected authentication (HTTP {status}); check provider credentials."
+    elif status == 404:
+        message = "Endpoint is reachable, but its models route returned HTTP 404; check the base URL and /v1 path."
+    else:
+        message = f"Endpoint is reachable but returned HTTP {status}."
+    return {"ok": False, "reachable": True, "status_code": status, "message": message}
 
 
 def create_app(service: JobService | None = None) -> FastAPI:
@@ -68,6 +173,13 @@ def create_app(service: JobService | None = None) -> FastAPI:
                 "backend_url": DEFAULT_CONFIG.get("backend_url"),
             },
         }
+
+    @app.post("/api/test-endpoint")
+    def test_endpoint(request: EndpointTestRequest):
+        try:
+            return probe_endpoint(request.provider, request.backend_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/runs")
     def list_runs():
