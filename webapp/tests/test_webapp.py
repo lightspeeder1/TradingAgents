@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from datetime import date
@@ -90,6 +91,73 @@ class ApiTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 422)
 
+    def test_resume_interrupted_run_copies_settings_and_accepts_fresh_credential(self):
+        original = self.service.submit(RunRequest(
+            ticker="MRVL", analysis_date=date.today().isoformat(),
+            provider="openrouter", quick_model="quick-example", deep_model="deep-example",
+            analysts=["market", "news"], debate_rounds=3, risk_rounds=2, checkpoint=True
+        ))
+        self.service._update(original["id"], status="interrupted", error="test interruption")
+        response = self.client.post(f"/api/runs/{original['id']}/resume", json={
+            "credential": "resume-only-token"
+        })
+        self.assertEqual(response.status_code, 202)
+        self.assertNotIn("resume-only-token", response.text)
+        resumed_id = response.json()["id"]
+        self.assertNotEqual(resumed_id, original["id"])
+        resumed_request = json.loads(self.service._request_json(resumed_id))
+        self.assertEqual(resumed_request["ticker"], "MRVL")
+        self.assertEqual(resumed_request["analysis_date"], date.today().isoformat())
+        self.assertEqual(resumed_request["provider"], "openrouter")
+        self.assertEqual(resumed_request["quick_model"], "quick-example")
+        self.assertEqual(resumed_request["deep_model"], "deep-example")
+        self.assertEqual(resumed_request["analysts"], ["market", "news"])
+        self.assertEqual(resumed_request["debate_rounds"], 3)
+        self.assertEqual(resumed_request["risk_rounds"], 2)
+        self.assertTrue(resumed_request["checkpoint"])
+        self.assertNotIn("resume-only-token", self.service._request_json(resumed_id))
+        self.assertEqual(self.service._credentials[resumed_id][1], "resume-only-token")
+        self.assertTrue(self.service.get(original["id"])["resume_available"])
+
+    def test_resume_rejects_completed_and_uncheckpointed_runs(self):
+        completed = self.service.submit(RunRequest(
+            ticker="MRVL", analysis_date=date.today().isoformat(), checkpoint=True
+        ))
+        self.service._update(completed["id"], status="completed")
+        completed_response = self.client.post(
+            f"/api/runs/{completed['id']}/resume", json={}
+        )
+        self.assertEqual(completed_response.status_code, 409)
+        self.assertFalse(self.service.get(completed["id"])["resume_available"])
+
+        uncheckpointed = self.service.submit(RunRequest(
+            ticker="NVDA", analysis_date=date.today().isoformat(), checkpoint=False
+        ))
+        self.service._update(uncheckpointed["id"], status="interrupted")
+        resume_response = self.client.post(
+            f"/api/runs/{uncheckpointed['id']}/resume", json={}
+        )
+        self.assertEqual(resume_response.status_code, 409)
+        self.assertFalse(self.service.get(uncheckpointed["id"])["resume_available"])
+
+    def test_delete_removes_terminal_run_record_only(self):
+        job = self.service.submit(RunRequest(
+            ticker="MRVL", analysis_date=date.today().isoformat()
+        ))
+        self.service._update(job["id"], status="failed", error="test failure")
+        response = self.client.delete(f"/api/runs/{job['id']}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"deleted": job["id"]})
+        self.assertIsNone(self.service.get(job["id"]))
+
+    def test_delete_rejects_queued_run(self):
+        job = self.service.submit(RunRequest(
+            ticker="MRVL", analysis_date=date.today().isoformat()
+        ))
+        response = self.client.delete(f"/api/runs/{job['id']}")
+        self.assertEqual(response.status_code, 409)
+        self.assertIsNotNone(self.service.get(job["id"]))
+
     def test_root_serves_dashboard(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
@@ -102,6 +170,8 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="apiCredential"', response.text)
         self.assertIn('type="password"', response.text)
         self.assertIn("Held transiently in memory only", response.text)
+        self.assertIn("data-resume", response.text)
+        self.assertIn("data-delete", response.text)
 
     def test_endpoint_test_probes_selected_local_compatible_server(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

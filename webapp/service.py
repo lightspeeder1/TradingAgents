@@ -152,6 +152,31 @@ class JobService:
             raise RuntimeError("Run was saved but could not be read back.")
         return job
 
+    def resume(self, job_id: str, credential: SecretStr | None = None) -> dict[str, Any]:
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT status,request_json FROM runs WHERE id=?", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        if row["status"] not in {"failed", "interrupted"}:
+            raise ValueError("Only failed or interrupted runs can be resumed.")
+        request = RunRequest.model_validate_json(row["request_json"])
+        if not request.checkpoint:
+            raise ValueError("This run did not have checkpointing enabled; submit a new run instead.")
+        return self.submit(request.model_copy(update={"credential": credential}))
+
+    def delete(self, job_id: str) -> dict[str, str]:
+        with self._db_lock:
+            row = self._conn.execute("SELECT status FROM runs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if row["status"] in {"queued", "running"}:
+                raise ValueError("Cannot delete a queued or running analysis.")
+            self._conn.execute("DELETE FROM runs WHERE id=?", (job_id,))
+            self._conn.commit()
+        return {"deleted": job_id}
+
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self._db_lock:
             row = self._conn.execute("SELECT * FROM runs WHERE id=?", (job_id,)).fetchone()
@@ -184,10 +209,16 @@ class JobService:
 
     @staticmethod
     def _serialize(row: sqlite3.Row) -> dict[str, Any]:
+        request = json.loads(row["request_json"])
+        resume_available = (
+            row["status"] in {"failed", "interrupted"}
+            and bool(request.get("checkpoint", True))
+        )
         return {
             "id": row["id"], "ticker": row["ticker"], "analysis_date": row["analysis_date"],
             "status": row["status"], "progress": json.loads(row["progress_json"]),
             "report_available": bool(row["report_path"] and Path(row["report_path"]).is_file()),
+            "resume_available": resume_available,
             "error": row["error"], "created_at": row["created_at"], "updated_at": row["updated_at"],
         }
 

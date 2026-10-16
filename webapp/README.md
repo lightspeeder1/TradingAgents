@@ -25,7 +25,7 @@ Set provider credentials in the repository `.env` (or environment) before starti
 - Incremental Markdown report output at `~/.tradingagents/logs/web_runs/<run-id>/`.
 - Existing engine artifacts and decision memory continue to use the normal `~/.tradingagents` locations.
 
-A server restart marks queued/running jobs as interrupted. Checkpointed engine state is retained, but this MVP does not yet provide an explicit “resume this run” button; resubmit the same ticker/date and graph settings to use the engine checkpoint.
+Server restarts mark queued/running jobs as interrupted. For checkpoint-enabled failed or interrupted runs, use **Resume** in the history row; it creates a new run with the original settings and continues from the engine checkpoint if one is available (otherwise it starts from the beginning). Re-enter the provider credential if needed because credentials are transient. **Delete** removes only the history record; report files and checkpoints are left on disk. Active queued/running jobs cannot be deleted from history.
 
 ## Verification
 

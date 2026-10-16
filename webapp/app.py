@@ -33,6 +33,10 @@ class EndpointTestRequest(BaseModel):
     credential: SecretStr | None = Field(default=None, exclude=True, repr=False)
 
 
+class ResumeRunRequest(BaseModel):
+    credential: SecretStr | None = Field(default=None, exclude=True, repr=False)
+
+
 def _endpoint_test_target(
     provider: str, backend_url: str | None, credential: SecretStr | None = None
 ) -> tuple[str, dict[str, str]]:
@@ -199,6 +203,24 @@ def create_app(service: JobService | None = None) -> FastAPI:
             return get_jobs().submit(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{job_id}/resume", status_code=202)
+    def resume_run(job_id: str, request: ResumeRunRequest):
+        try:
+            return get_jobs().resume(job_id, request.credential)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Run not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/runs/{job_id}")
+    def delete_run(job_id: str):
+        try:
+            return get_jobs().delete(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Run not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/runs/{job_id}")
     def get_run(job_id: str):
