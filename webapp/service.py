@@ -11,7 +11,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from cli.models import AnalystType
 from cli.prompts import detect_asset_type, normalize_ticker_symbol, is_valid_ticker_input
@@ -50,6 +50,7 @@ class RunRequest(BaseModel):
     quick_model: str = Field(default_factory=lambda: configured_default_models()[0])
     deep_model: str = Field(default_factory=lambda: configured_default_models()[1])
     backend_url: str | None = DEFAULT_CONFIG.get("backend_url")
+    credential: SecretStr | None = Field(default=None, exclude=True, repr=False)
     debate_rounds: int = Field(default=DEFAULT_CONFIG["max_debate_rounds"], ge=1, le=10)
     risk_rounds: int = Field(default=DEFAULT_CONFIG["max_risk_discuss_rounds"], ge=1, le=10)
     max_tokens: int | None = Field(default=DEFAULT_CONFIG.get("max_tokens"), ge=256, le=65536)
@@ -86,6 +87,8 @@ def validate_run_request(request: RunRequest) -> RunRequest:
     provider = request.provider.strip().lower()
     if provider not in providers:
         raise ValueError(f"Unsupported LLM provider: {provider}")
+    if request.credential is not None and request.credential.get_secret_value() and provider == "ollama":
+        raise ValueError("Ollama's built-in endpoint is keyless. For an authenticated local server, use OpenAI-compatible.")
     if not request.quick_model.strip() or not request.deep_model.strip():
         raise ValueError("Both quick and deep model IDs are required.")
     if request.backend_url and not request.backend_url.startswith(("http://", "https://")):
@@ -103,6 +106,8 @@ class JobService:
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_lock = threading.RLock()
+        self._credential_lock = threading.Lock()
+        self._credentials: dict[str, tuple[str, str]] = {}
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("""CREATE TABLE IF NOT EXISTS runs (
@@ -124,6 +129,10 @@ class JobService:
 
     def submit(self, request: RunRequest) -> dict[str, Any]:
         request = validate_run_request(request)
+        secret = request.credential.get_secret_value() if request.credential is not None else ""
+        credential_env = "AWS_BEARER_TOKEN_BEDROCK" if request.provider == "bedrock" else PROVIDER_API_KEY_ENV.get(request.provider)
+        if secret and not credential_env:
+            raise ValueError(f"Provider '{request.provider}' does not accept a credential in this field.")
         job_id = uuid.uuid4().hex
         now = datetime.now().isoformat(timespec="seconds")
         initial_progress = {"stage": "Queued", "percent": 0, "completed_analysts": []}
@@ -133,6 +142,9 @@ class JobService:
                 (job_id, request.ticker, request.analysis_date, "queued", request.model_dump_json(), json.dumps(initial_progress), now, now),
             )
             self._conn.commit()
+        if secret and credential_env:
+            with self._credential_lock:
+                self._credentials[job_id] = (credential_env, secret)
         if self._worker:
             self._queue.put(job_id)
         job = self.get(job_id)
@@ -165,6 +177,8 @@ class JobService:
         if self._worker:
             self._queue.put(None)
             self._worker.join(timeout=3)
+        with self._credential_lock:
+            self._credentials.clear()
         with self._db_lock:
             self._conn.close()
 
@@ -202,7 +216,14 @@ class JobService:
         request = RunRequest.model_validate_json(self._request_json(job_id))
         progress = {"stage": "Starting", "percent": 1, "completed_analysts": []}
         self._update(job_id, status="running", error=None, progress_json=progress)
+        with self._credential_lock:
+            runtime_credential = self._credentials.pop(job_id, None)
+        credential_env = runtime_credential[0] if runtime_credential else None
+        credential_value = runtime_credential[1] if runtime_credential else None
+        previous_credential = os.environ.get(credential_env) if credential_env else None
         try:
+            if credential_env and credential_value:
+                os.environ[credential_env] = credential_value
             config = DEFAULT_CONFIG.copy()
             config.update({
                 "llm_provider": request.provider,
@@ -245,11 +266,20 @@ class JobService:
             progress.update({"stage": "Complete", "percent": 100})
             self._update(job_id, status="completed", progress_json=progress, report_path=str(report_file), error=None)
         except Exception as exc:
-            # Keep any interim report and surface a concise error in the run record.
+            # Keep interim reports and never persist a submitted credential in errors.
             current = self.get(job_id)
             progress = current["progress"] if current else {"stage": "Failed", "percent": 0}
             progress["stage"] = "Failed"
-            self._update(job_id, status="failed", progress_json=progress, error=f"{type(exc).__name__}: {exc}")
+            error = f"{type(exc).__name__}: {exc}"
+            if credential_value:
+                error = error.replace(credential_value, "[redacted]")
+            self._update(job_id, status="failed", progress_json=progress, error=error)
+        finally:
+            if credential_env:
+                if previous_credential is None:
+                    os.environ.pop(credential_env, None)
+                else:
+                    os.environ[credential_env] = previous_credential
 
     def _request_json(self, job_id: str) -> str:
         with self._db_lock:

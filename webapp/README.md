@@ -1,6 +1,6 @@
 # TradingAgents Web (local MVP)
 
-A local dashboard around the existing TradingAgents LangGraph engine. It adds run configuration, a persistent run queue/history, stage progress, and report viewing. It does not place trades or send credentials to the browser.
+A local dashboard around the existing TradingAgents LangGraph engine. It adds run configuration, a persistent run queue/history, stage progress, and report viewing. It does not place trades. Provider credentials can be entered in a password-masked field and are sent to the local server for endpoint checks or run processing; they are never returned in dashboard/API responses or saved in SQLite/browser storage.
 
 ## Start
 
@@ -13,7 +13,7 @@ uvicorn webapp.app:app --host 127.0.0.1 --port 8765
 
 Open `http://127.0.0.1:8765`. Keep the host bound to `127.0.0.1`; this MVP has no user authentication and is intended for local use only.
 
-Set your provider credentials in the repository `.env` (or the environment) before starting. The dashboard never returns credential values. Select a cloud provider and its model IDs, or choose a local endpoint preset: Ollama (`127.0.0.1:11434`), LM Studio (`127.0.0.1:1234`), or vLLM (`127.0.0.1:8000`). Custom OpenAI-compatible URLs are also supported; enter model IDs served by that endpoint. The endpoint must be reachable from the machine running TradingAgents. Runs are processed serially because the core engine uses process-level configuration and per-ticker/date checkpoints.
+Set provider credentials in the repository `.env` (or environment) before starting, or enter the credential in the dashboard's password-masked field. A dashboard-entered credential is used for endpoint checks and the queued run, applied to the worker's environment only while processing, then discarded; a successful run submission clears the form field. It is not stored in the run record, SQLite, browser storage, or API responses. The web app does not intentionally log the value and redacts it from persisted run errors. Environment-configured credentials remain a fallback when the field is blank. Keep the app bound to `127.0.0.1` and do not expose it to a network: this MVP has no user authentication. Select a cloud provider and its model IDs, or choose a local endpoint preset: Ollama (`127.0.0.1:11434`), LM Studio (`127.0.0.1:1234`), or vLLM (`127.0.0.1:8000`). Custom OpenAI-compatible URLs are also supported; enter model IDs served by that endpoint. The endpoint must be reachable from the machine running TradingAgents. Runs are processed serially because the core engine uses process-level configuration and per-ticker/date checkpoints. Ollama is keyless; use OpenAI-compatible for a local server requiring authentication. Bedrock run credentials are supported, but the non-generative endpoint probe does not support Bedrock.
 
 ## What is included
 

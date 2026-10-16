@@ -10,7 +10,7 @@ from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, SecretStr
 
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
@@ -30,13 +30,19 @@ ANALYSTS = [
 class EndpointTestRequest(BaseModel):
     provider: str
     backend_url: str | None = None
+    credential: SecretStr | None = Field(default=None, exclude=True, repr=False)
 
 
-def _endpoint_test_target(provider: str, backend_url: str | None) -> tuple[str, dict[str, str]]:
+def _endpoint_test_target(
+    provider: str, backend_url: str | None, credential: SecretStr | None = None
+) -> tuple[str, dict[str, str]]:
     """Resolve a provider's non-generative model-list endpoint and auth headers."""
     provider = provider.strip().lower()
     if provider not in PROVIDER_API_KEY_ENV:
         raise ValueError(f"Unsupported LLM provider: {provider}")
+    credential_value = credential.get_secret_value() if credential is not None else None
+    if provider == "ollama" and credential_value:
+        raise ValueError("The built-in Ollama endpoint does not use credentials. Use OpenAI-compatible for an authenticated proxy.")
     if backend_url and provider not in {"ollama", "openai_compatible"}:
         raise ValueError("Use the OpenAI-compatible provider for a custom endpoint; hosted provider credentials will not be sent to custom URLs.")
 
@@ -51,14 +57,14 @@ def _endpoint_test_target(provider: str, backend_url: str | None) -> tuple[str, 
         if not base_url:
             raise ValueError("Enter a base URL for this OpenAI-compatible endpoint.")
         api_key_env = PROVIDER_API_KEY_ENV.get(provider)
-        api_key = os.environ.get(api_key_env) if api_key_env else None
+        api_key = credential_value or (os.environ.get(api_key_env) if api_key_env else None)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         return f"{base_url.rstrip('/')}/models", headers
 
     if provider == "anthropic":
         base_url = backend_url or "https://api.anthropic.com"
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = credential_value or os.environ.get("ANTHROPIC_API_KEY")
         if api_key:
             headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
@@ -67,7 +73,7 @@ def _endpoint_test_target(provider: str, backend_url: str | None) -> tuple[str, 
 
     if provider == "google":
         base_url = backend_url or "https://generativelanguage.googleapis.com"
-        api_key = os.environ.get("GOOGLE_API_KEY")
+        api_key = credential_value or os.environ.get("GOOGLE_API_KEY")
         if api_key:
             headers["x-goog-api-key"] = api_key
         return f"{base_url.rstrip('/')}/v1beta/models", headers
@@ -76,7 +82,7 @@ def _endpoint_test_target(provider: str, backend_url: str | None) -> tuple[str, 
         base_url = backend_url or os.environ.get("AZURE_OPENAI_ENDPOINT")
         if not base_url:
             raise ValueError("Set AZURE_OPENAI_ENDPOINT or enter an endpoint URL first.")
-        api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        api_key = credential_value or os.environ.get("AZURE_OPENAI_API_KEY")
         if api_key:
             headers["api-key"] = api_key
         version = os.environ.get("OPENAI_API_VERSION", "2024-10-21")
@@ -88,7 +94,9 @@ def _endpoint_test_target(provider: str, backend_url: str | None) -> tuple[str, 
     raise ValueError(f"Endpoint testing is not configured for provider: {provider}")
 
 
-def probe_endpoint(provider: str, backend_url: str | None) -> dict[str, object]:
+def probe_endpoint(
+    provider: str, backend_url: str | None, credential: SecretStr | None = None
+) -> dict[str, object]:
     """Check endpoint reachability without sending a model prompt or spending tokens."""
     if backend_url:
         supplied = urlsplit(backend_url)
@@ -99,7 +107,7 @@ def probe_endpoint(provider: str, backend_url: str | None) -> dict[str, object]:
             supplied.port
         except ValueError as exc:
             raise ValueError("Endpoint URL has an invalid port.") from exc
-    target, headers = _endpoint_test_target(provider, backend_url)
+    target, headers = _endpoint_test_target(provider, backend_url, credential)
     parsed = urlsplit(target)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("Resolved provider endpoint is not a valid http:// or https:// URL.")
@@ -177,7 +185,7 @@ def create_app(service: JobService | None = None) -> FastAPI:
     @app.post("/api/test-endpoint")
     def test_endpoint(request: EndpointTestRequest):
         try:
-            return probe_endpoint(request.provider, request.backend_url)
+            return probe_endpoint(request.provider, request.backend_url, request.credential)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

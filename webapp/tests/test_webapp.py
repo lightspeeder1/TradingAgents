@@ -1,9 +1,11 @@
+import os
 import unittest
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from webapp.app import create_app
 from webapp.service import JobService, RunRequest, validate_run_request
@@ -42,6 +44,14 @@ class RequestValidationTests(unittest.TestCase):
         ))
         self.assertEqual(run.provider, "ollama")
         self.assertEqual(run.backend_url, "http://127.0.0.1:11434/v1")
+
+    def test_credential_is_available_in_memory_but_excluded_from_serialization(self):
+        request = RunRequest(
+            ticker="MRVL", analysis_date=date.today().isoformat(),
+            credential="never-persist-this-value"
+        )
+        self.assertEqual(request.credential.get_secret_value(), "never-persist-this-value")
+        self.assertNotIn("never-persist-this-value", request.model_dump_json())
 
     def test_rejects_empty_analysts(self):
         with self.assertRaises(ValueError):
@@ -89,13 +99,19 @@ class ApiTests(unittest.TestCase):
         self.assertIn("lm_studio_local", response.text)
         self.assertIn("vllm_local", response.text)
         self.assertIn("testEndpointButton", response.text)
+        self.assertIn('id="apiCredential"', response.text)
+        self.assertIn('type="password"', response.text)
+        self.assertIn("Held transiently in memory only", response.text)
 
     def test_endpoint_test_probes_selected_local_compatible_server(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import threading
 
+        observed_auth = []
+
         class ModelsHandler(BaseHTTPRequestHandler):
             def do_GET(self):
+                observed_auth.append(self.headers.get("Authorization"))
                 if self.path != "/v1/models":
                     self.send_response(404)
                     self.end_headers()
@@ -115,6 +131,7 @@ class ApiTests(unittest.TestCase):
             response = self.client.post("/api/test-endpoint", json={
                 "provider": "openai_compatible",
                 "backend_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "credential": "endpoint-test-secret",
             })
         finally:
             server.shutdown()
@@ -123,6 +140,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
         self.assertIn("HTTP 200", response.json()["message"])
+        self.assertEqual(observed_auth, ["Bearer endpoint-test-secret"])
+        self.assertNotIn("endpoint-test-secret", response.text)
 
     def test_endpoint_probe_rejects_custom_url_for_hosted_provider(self):
         with patch("webapp.app.urlopen") as mocked_open:
@@ -140,9 +159,62 @@ class ApiTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 422)
 
+    def test_api_submit_does_not_return_or_persist_credential(self):
+        secret = "api-submit-only-secret"
+        response = self.client.post("/api/runs", json={
+            "ticker": "MRVL", "analysis_date": date.today().isoformat(),
+            "provider": "openrouter", "credential": secret,
+        })
+        self.assertEqual(response.status_code, 202)
+        self.assertNotIn(secret, response.text)
+        job_id = response.json()["id"]
+        self.assertNotIn(secret, self.service._request_json(job_id))
+        self.assertEqual(self.service._credentials[job_id][1], secret)
+
+    def test_submit_keeps_credential_in_memory_without_persisting_or_returning_it(self):
+        secret = "transient-run-credential"
+        job = self.service.submit(RunRequest(
+            ticker="MRVL", analysis_date=date.today().isoformat(),
+            provider="openrouter", credential=SecretStr(secret)
+        ))
+        self.assertNotIn(secret, self.service._request_json(job["id"]))
+        self.assertNotIn(secret, str(job))
+        self.assertEqual(self.service._credentials[job["id"]][1], secret)
+
+    def test_worker_redacts_credential_from_persisted_error(self):
+        secret = "failure-path-private-key"
+
+        class FailingGraph:
+            def __init__(self, *_args, **_kwargs):
+                raise RuntimeError(f"simulated error containing {secret}")
+
+        with TemporaryDirectory() as directory:
+            service = JobService(start_worker=True, db_path=Path(directory) / "runs.db")
+            try:
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "ambient-original"}):
+                    with patch("webapp.service.TradingAgentsGraph", FailingGraph):
+                        submitted = service.submit(RunRequest(
+                            ticker="MRVL", analysis_date="2026-10-15",
+                            provider="openrouter", credential=SecretStr(secret)
+                        ))
+                        service._queue.join()
+                    failed = service.get(submitted["id"])
+                    if failed is None:
+                        self.fail("worker did not persist the failed run")
+                    self.assertEqual(os.environ["OPENROUTER_API_KEY"], "ambient-original")
+                self.assertEqual(failed["status"], "failed")
+                self.assertIn("[redacted]", failed["error"])
+                self.assertNotIn(secret, failed["error"])
+                self.assertNotIn(submitted["id"], service._credentials)
+            finally:
+                service.close()
+
     def test_worker_finishes_run_and_persists_report(self):
         class FakeGraph:
+            observed_api_key = None
+
             def __init__(self, *_args, **_kwargs):
+                FakeGraph.observed_api_key = os.environ.get("OPENROUTER_API_KEY")
                 self.graph = self
                 self.propagator = self
 
@@ -199,16 +271,23 @@ class ApiTests(unittest.TestCase):
             }
             service = JobService(start_worker=True, db_path=Path(directory) / "runs.db")
             try:
-                with patch("webapp.service.DEFAULT_CONFIG", config), patch("webapp.service.TradingAgentsGraph", FakeGraph):
-                    submitted = service.submit(RunRequest(
-                        ticker="MRVL", analysis_date="2026-10-15",
-                        analysts=["market", "social", "news", "fundamentals"]
-                    ))
-                    service._queue.join()
-                finished = service.get(submitted["id"])
+                secret = "run-only-openrouter-key"
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "ambient-original"}):
+                    with patch("webapp.service.DEFAULT_CONFIG", config), patch("webapp.service.TradingAgentsGraph", FakeGraph):
+                        submitted = service.submit(RunRequest(
+                            ticker="MRVL", analysis_date="2026-10-15",
+                            analysts=["market", "social", "news", "fundamentals"],
+                            provider="openrouter", credential=SecretStr(secret)
+                        ))
+                        service._queue.join()
+                    finished = service.get(submitted["id"])
+                    self.assertEqual(FakeGraph.observed_api_key, secret)
+                    self.assertEqual(os.environ["OPENROUTER_API_KEY"], "ambient-original")
                 self.assertEqual(finished["status"], "completed")
                 self.assertTrue(finished["report_available"])
                 self.assertEqual(service.report(submitted["id"]), "test report")
+                self.assertNotIn(secret, service._request_json(submitted["id"]))
+                self.assertNotIn(submitted["id"], service._credentials)
             finally:
                 service.close()
 
