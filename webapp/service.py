@@ -10,6 +10,7 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, SecretStr
 
@@ -19,6 +20,8 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
 from tradingagents.dataflows.config import run_config
+
+from .secure_store import KeyringSecretStore, SecretStoreError
 
 
 def configured_default_provider() -> str:
@@ -51,11 +54,49 @@ class RunRequest(BaseModel):
     deep_model: str = Field(default_factory=lambda: configured_default_models()[1])
     backend_url: str | None = DEFAULT_CONFIG.get("backend_url")
     credential: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    saved_endpoint_id: str | None = None
     debate_rounds: int = Field(default=DEFAULT_CONFIG["max_debate_rounds"], ge=1, le=10)
     risk_rounds: int = Field(default=DEFAULT_CONFIG["max_risk_discuss_rounds"], ge=1, le=10)
     max_tokens: int | None = Field(default=DEFAULT_CONFIG.get("max_tokens"), ge=256, le=65536)
     output_language: str = DEFAULT_CONFIG["output_language"]
     checkpoint: bool = True
+
+
+class SavedEndpointRequest(BaseModel):
+    name: str
+    base_url: str
+    quick_model: str
+    deep_model: str
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    clear_api_key: bool = False
+
+
+def _validate_base_url(value: str) -> str:
+    base_url = value.strip().rstrip("/")
+    try:
+        parsed = urlsplit(base_url)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Endpoint URL has an invalid port.") from exc
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("Endpoint URL must be an http:// or https:// base URL without credentials, query, or fragment.")
+    return base_url
+
+
+def validate_saved_endpoint(request: SavedEndpointRequest) -> SavedEndpointRequest:
+    name = request.name.strip()
+    quick_model = request.quick_model.strip()
+    deep_model = request.deep_model.strip()
+    base_url = _validate_base_url(request.base_url)
+    if not name or len(name) > 80:
+        raise ValueError("Endpoint profile name must contain 1–80 characters.")
+    if not quick_model or not deep_model:
+        raise ValueError("Quick and deep model IDs are required.")
+    return request.model_copy(update={
+        "name": name, "base_url": base_url,
+        "quick_model": quick_model, "deep_model": deep_model,
+    })
 
 
 def validate_run_request(request: RunRequest) -> RunRequest:
@@ -91,18 +132,21 @@ def validate_run_request(request: RunRequest) -> RunRequest:
         raise ValueError("Ollama's built-in endpoint is keyless. For an authenticated local server, use OpenAI-compatible.")
     if not request.quick_model.strip() or not request.deep_model.strip():
         raise ValueError("Both quick and deep model IDs are required.")
-    if request.backend_url and not request.backend_url.startswith(("http://", "https://")):
-        raise ValueError("Backend URL must start with http:// or https://.")
+    backend_url = _validate_base_url(request.backend_url) if request.backend_url else None
 
-    return request.model_copy(update={"ticker": ticker, "provider": provider})
+    return request.model_copy(update={"ticker": ticker, "provider": provider, "backend_url": backend_url})
 
 
 class JobService:
     """SQLite-backed run history with one serialized worker for safe local use."""
 
-    def __init__(self, start_worker: bool = True, db_path: str | Path | None = None):
+    def __init__(
+        self, start_worker: bool = True, db_path: str | Path | None = None,
+        secret_store: Any | None = None,
+    ):
         default_path = Path.home() / ".tradingagents" / "web" / "runs.sqlite3"
         self.db_path = str(db_path or default_path)
+        self._secret_store = secret_store or KeyringSecretStore()
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_lock = threading.RLock()
@@ -114,6 +158,12 @@ class JobService:
             id TEXT PRIMARY KEY, ticker TEXT NOT NULL, analysis_date TEXT NOT NULL,
             status TEXT NOT NULL, request_json TEXT NOT NULL, progress_json TEXT NOT NULL,
             report_path TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS saved_endpoints (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL,
+            quick_model TEXT NOT NULL, deep_model TEXT NOT NULL,
+            has_api_key INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         )""")
         self._conn.execute(
             "UPDATE runs SET status='interrupted', error='Server restarted before this run completed', updated_at=? WHERE status IN ('queued','running')",
@@ -128,6 +178,21 @@ class JobService:
             self._worker.start()
 
     def submit(self, request: RunRequest) -> dict[str, Any]:
+        if request.saved_endpoint_id:
+            if request.provider.strip().lower() != "openai_compatible":
+                raise ValueError("Saved custom endpoint profiles require the OpenAI-compatible provider.")
+            profile = self.get_saved_endpoint(request.saved_endpoint_id)
+            if profile is None:
+                raise ValueError("Saved endpoint profile was not found; refresh the endpoint list.")
+            request = request.model_copy(update={"backend_url": profile["base_url"]})
+            provided_secret = (
+                request.credential.get_secret_value()
+                if request.credential is not None else ""
+            )
+            if not provided_secret and profile["has_api_key"]:
+                saved_secret = self.get_saved_endpoint_secret(request.saved_endpoint_id)
+                if saved_secret:
+                    request = request.model_copy(update={"credential": SecretStr(saved_secret)})
         request = validate_run_request(request)
         secret = request.credential.get_secret_value() if request.credential is not None else ""
         credential_env = "AWS_BEARER_TOKEN_BEDROCK" if request.provider == "bedrock" else PROVIDER_API_KEY_ENV.get(request.provider)
@@ -152,6 +217,113 @@ class JobService:
             raise RuntimeError("Run was saved but could not be read back.")
         return job
 
+    def create_saved_endpoint(self, request: SavedEndpointRequest) -> dict[str, Any]:
+        request = validate_saved_endpoint(request)
+        if request.clear_api_key:
+            raise ValueError("clear_api_key is only valid when updating a saved endpoint.")
+        api_key = request.api_key.get_secret_value() if request.api_key is not None else ""
+        endpoint_id = uuid.uuid4().hex
+        now = datetime.now().isoformat(timespec="seconds")
+        if api_key:
+            self._secret_store.set_secret(endpoint_id, api_key)
+        try:
+            with self._db_lock:
+                self._conn.execute(
+                    "INSERT INTO saved_endpoints (id,name,base_url,quick_model,deep_model,has_api_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (endpoint_id, request.name, request.base_url, request.quick_model,
+                     request.deep_model, int(bool(api_key)), now, now),
+                )
+                self._conn.commit()
+        except Exception:
+            if api_key:
+                self._secret_store.delete_secret(endpoint_id)
+            raise
+        profile = self.get_saved_endpoint(endpoint_id)
+        if profile is None:
+            raise RuntimeError("Saved endpoint was inserted but could not be read back.")
+        return profile
+
+    def update_saved_endpoint(
+        self, endpoint_id: str, request: SavedEndpointRequest
+    ) -> dict[str, Any] | None:
+        request = validate_saved_endpoint(request)
+        api_key = request.api_key.get_secret_value() if request.api_key is not None else ""
+        if api_key and request.clear_api_key:
+            raise ValueError("Enter a new API key or choose to clear the saved key, not both.")
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT has_api_key FROM saved_endpoints WHERE id=?", (endpoint_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        has_api_key = bool(row["has_api_key"])
+        if api_key:
+            self._secret_store.set_secret(endpoint_id, api_key)
+            has_api_key = True
+        elif request.clear_api_key:
+            if has_api_key:
+                self._secret_store.delete_secret(endpoint_id)
+            has_api_key = False
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._db_lock:
+            self._conn.execute(
+                "UPDATE saved_endpoints SET name=?,base_url=?,quick_model=?,deep_model=?,has_api_key=?,updated_at=? WHERE id=?",
+                (request.name, request.base_url, request.quick_model,
+                 request.deep_model, int(has_api_key), now, endpoint_id),
+            )
+            self._conn.commit()
+        return self.get_saved_endpoint(endpoint_id)
+
+    def delete_saved_endpoint(self, endpoint_id: str) -> dict[str, str] | None:
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT has_api_key FROM saved_endpoints WHERE id=?", (endpoint_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        if row["has_api_key"]:
+            self._secret_store.delete_secret(endpoint_id)
+        with self._db_lock:
+            self._conn.execute("DELETE FROM saved_endpoints WHERE id=?", (endpoint_id,))
+            self._conn.commit()
+        return {"deleted": endpoint_id}
+
+    def get_saved_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT * FROM saved_endpoints WHERE id=?", (endpoint_id,)
+            ).fetchone()
+        return self._serialize_saved_endpoint(row) if row else None
+
+    def list_saved_endpoints(self) -> list[dict[str, Any]]:
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT * FROM saved_endpoints ORDER BY name COLLATE NOCASE, created_at"
+            ).fetchall()
+        return [self._serialize_saved_endpoint(row) for row in rows]
+
+    def get_saved_endpoint_secret(self, endpoint_id: str) -> str | None:
+        profile = self.get_saved_endpoint(endpoint_id)
+        if profile is None:
+            raise KeyError(endpoint_id)
+        if not profile["has_api_key"]:
+            return None
+        secret = self._secret_store.get_secret(endpoint_id)
+        if not secret:
+            raise SecretStoreError(
+                "The saved API key is unavailable. Update the profile or enter the key again."
+            )
+        return secret
+
+    @staticmethod
+    def _serialize_saved_endpoint(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"], "name": row["name"], "base_url": row["base_url"],
+            "quick_model": row["quick_model"], "deep_model": row["deep_model"],
+            "has_api_key": bool(row["has_api_key"]),
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+        }
+
     def resume(self, job_id: str, credential: SecretStr | None = None) -> dict[str, Any]:
         with self._db_lock:
             row = self._conn.execute(
@@ -164,6 +336,8 @@ class JobService:
         request = RunRequest.model_validate_json(row["request_json"])
         if not request.checkpoint:
             raise ValueError("This run did not have checkpointing enabled; submit a new run instead.")
+        if request.saved_endpoint_id and self.get_saved_endpoint(request.saved_endpoint_id) is None:
+            request = request.model_copy(update={"saved_endpoint_id": None})
         return self.submit(request.model_copy(update={"credential": credential}))
 
     def delete(self, job_id: str) -> dict[str, str]:

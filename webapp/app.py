@@ -16,7 +16,11 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
 from tradingagents.llm_clients.openai_client import OPENAI_COMPATIBLE_PROVIDERS
 
-from .service import JobService, RunRequest, configured_default_models, configured_default_provider
+from .secure_store import SecretStoreError
+from .service import (
+    JobService, RunRequest, SavedEndpointRequest,
+    configured_default_models, configured_default_provider,
+)
 
 
 ANALYSTS = [
@@ -30,6 +34,7 @@ ANALYSTS = [
 class EndpointTestRequest(BaseModel):
     provider: str
     backend_url: str | None = None
+    saved_endpoint_id: str | None = None
     credential: SecretStr | None = Field(default=None, exclude=True, repr=False)
 
 
@@ -186,12 +191,62 @@ def create_app(service: JobService | None = None) -> FastAPI:
             },
         }
 
+    @app.get("/api/endpoints")
+    def list_saved_endpoints():
+        return get_jobs().list_saved_endpoints()
+
+    @app.post("/api/endpoints", status_code=201)
+    def create_saved_endpoint(request: SavedEndpointRequest):
+        try:
+            return get_jobs().create_saved_endpoint(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.put("/api/endpoints/{endpoint_id}")
+    def update_saved_endpoint(endpoint_id: str, request: SavedEndpointRequest):
+        try:
+            result = get_jobs().update_saved_endpoint(endpoint_id, request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Saved endpoint profile not found")
+        return result
+
+    @app.delete("/api/endpoints/{endpoint_id}")
+    def delete_saved_endpoint(endpoint_id: str):
+        try:
+            result = get_jobs().delete_saved_endpoint(endpoint_id)
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Saved endpoint profile not found")
+        return result
+
     @app.post("/api/test-endpoint")
     def test_endpoint(request: EndpointTestRequest):
         try:
-            return probe_endpoint(request.provider, request.backend_url, request.credential)
+            backend_url = request.backend_url
+            credential = request.credential
+            if request.saved_endpoint_id:
+                profile = get_jobs().get_saved_endpoint(request.saved_endpoint_id)
+                if profile is None:
+                    raise HTTPException(status_code=404, detail="Saved endpoint profile not found")
+                if request.provider.strip().lower() != "openai_compatible":
+                    raise ValueError("Saved custom endpoint profiles require the OpenAI-compatible provider.")
+                backend_url = profile["base_url"]
+                if credential is None or not credential.get_secret_value():
+                    saved_secret = get_jobs().get_saved_endpoint_secret(request.saved_endpoint_id)
+                    if saved_secret:
+                        credential = SecretStr(saved_secret)
+            return probe_endpoint(request.provider, backend_url, credential)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.get("/api/runs")
     def list_runs():
@@ -203,6 +258,8 @@ def create_app(service: JobService | None = None) -> FastAPI:
             return get_jobs().submit(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.post("/api/runs/{job_id}/resume", status_code=202)
     def resume_run(job_id: str, request: ResumeRunRequest):
@@ -212,6 +269,8 @@ def create_app(service: JobService | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Run not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.delete("/api/runs/{job_id}")
     def delete_run(job_id: str):

@@ -4,12 +4,28 @@ import unittest
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from webapp.app import create_app
-from webapp.service import JobService, RunRequest, validate_run_request
+from webapp.secure_store import KeyringSecretStore, SecretStoreError
+from webapp.service import JobService, RunRequest, SavedEndpointRequest, validate_run_request
+
+
+class MemorySecretStore:
+    def __init__(self):
+        self.values = {}
+
+    def set_secret(self, key, value):
+        self.values[key] = value
+
+    def get_secret(self, key):
+        return self.values.get(key)
+
+    def delete_secret(self, key):
+        self.values.pop(key, None)
 
 
 class RequestValidationTests(unittest.TestCase):
@@ -37,6 +53,13 @@ class RequestValidationTests(unittest.TestCase):
         ))
         self.assertEqual(run.backend_url, "http://127.0.0.1:1234/v1")
 
+    def test_rejects_embedded_credentials_in_backend_url(self):
+        with self.assertRaises(ValueError):
+            validate_run_request(RunRequest(
+                ticker="MRVL", analysis_date=date.today().isoformat(),
+                provider="openai_compatible", backend_url="https://user:secret@example.com/v1",
+            ))
+
     def test_accepts_ollama_local_endpoint(self):
         run = validate_run_request(RunRequest(
             ticker="MRVL", analysis_date=date.today().isoformat(),
@@ -59,9 +82,41 @@ class RequestValidationTests(unittest.TestCase):
             validate_run_request(RunRequest(ticker="MRVL", analysis_date="2026-10-15", analysts=[]))
 
 
+class SecureStoreTests(unittest.TestCase):
+    def test_refuses_unrecommended_keyring_backend(self):
+        import keyring
+
+        with patch.object(keyring, "get_keyring", return_value=SimpleNamespace(priority=0)):
+            with self.assertRaises(SecretStoreError):
+                KeyringSecretStore()._keyring()
+
+
+class SavedEndpointPersistenceTests(unittest.TestCase):
+    def test_profile_metadata_and_key_reference_survive_service_restart(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "runs.sqlite3"
+            secrets = MemorySecretStore()
+            first = JobService(start_worker=False, db_path=database, secret_store=secrets)
+            profile = first.create_saved_endpoint(SavedEndpointRequest(
+                name="Persistent", base_url="https://llm.example/v1",
+                quick_model="fast", deep_model="deep", api_key="persisted-secret",
+            ))
+            first.close()
+
+            second = JobService(start_worker=False, db_path=database, secret_store=secrets)
+            try:
+                loaded = second.get_saved_endpoint(profile["id"])
+                self.assertEqual(loaded["name"], "Persistent")
+                self.assertEqual(second.get_saved_endpoint_secret(profile["id"]), "persisted-secret")
+            finally:
+                second.close()
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
-        self.service = JobService(start_worker=False, db_path=":memory:")
+        self.service = JobService(
+            start_worker=False, db_path=":memory:", secret_store=MemorySecretStore()
+        )
         self.client = TestClient(create_app(self.service))
 
     def tearDown(self):
@@ -172,6 +227,124 @@ class ApiTests(unittest.TestCase):
         self.assertIn("Held transiently in memory only", response.text)
         self.assertIn("data-resume", response.text)
         self.assertIn("data-delete", response.text)
+        self.assertIn('id="savedEndpointSelect"', response.text)
+        self.assertIn('id="saveEndpointButton"', response.text)
+        self.assertIn('id="updateEndpointButton"', response.text)
+        self.assertIn('id="deleteEndpointButton"', response.text)
+
+    def test_saved_endpoint_rejects_url_credentials(self):
+        response = self.client.post("/api/endpoints", json={
+            "name": "Bad URL", "base_url": "https://user:secret@example.com/v1",
+            "quick_model": "fast", "deep_model": "deep", "api_key": "not-stored",
+        })
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("secret", response.text)
+        self.assertEqual(self.client.get("/api/endpoints").json(), [])
+        self.assertEqual(self.service._secret_store.values, {})
+
+    def test_saved_endpoint_crud_stores_key_outside_sqlite_and_feeds_runs(self):
+        secret = "keychain-only-secret"
+        payload = {
+            "name": "Local gateway", "base_url": "http://127.0.0.1:9123/v1",
+            "quick_model": "fast-model", "deep_model": "deep-model", "api_key": secret,
+        }
+        created = self.client.post("/api/endpoints", json=payload)
+        self.assertEqual(created.status_code, 201)
+        profile = created.json()
+        self.assertTrue(profile["has_api_key"])
+        self.assertNotIn("api_key", profile)
+        self.assertNotIn(secret, created.text)
+        profile_id = profile["id"]
+
+        listed = self.client.get("/api/endpoints")
+        self.assertEqual(listed.status_code, 200)
+        self.assertNotIn(secret, listed.text)
+        row = self.service._conn.execute(
+            "SELECT * FROM saved_endpoints WHERE id=?", (profile_id,)
+        ).fetchone()
+        self.assertNotIn(secret, str(tuple(row)))
+
+        run_response = self.client.post("/api/runs", json={
+            "ticker": "MRVL", "analysis_date": date.today().isoformat(),
+            "provider": "openai_compatible", "backend_url": "http://other.example/v1",
+            "quick_model": payload["quick_model"], "deep_model": payload["deep_model"],
+            "saved_endpoint_id": profile_id,
+        })
+        self.assertEqual(run_response.status_code, 202)
+        run_id = run_response.json()["id"]
+        self.assertNotIn(secret, run_response.text)
+        run_request = self.service._request_json(run_id)
+        self.assertNotIn(secret, run_request)
+        self.assertEqual(json.loads(run_request)["backend_url"], payload["base_url"])
+        self.assertEqual(self.service._credentials[run_id][1], secret)
+
+        update = self.client.put(f"/api/endpoints/{profile_id}", json={
+            "name": "Renamed gateway", "base_url": "http://127.0.0.1:9124/v1",
+            "quick_model": "new-fast", "deep_model": "new-deep",
+        })
+        self.assertEqual(update.status_code, 200)
+        self.assertTrue(update.json()["has_api_key"])
+        self.assertEqual(self.service._secret_store.get_secret(profile_id), secret)
+        self.assertNotIn(secret, update.text)
+
+        replaced = self.client.put(f"/api/endpoints/{profile_id}", json={
+            "name": "Renamed gateway", "base_url": "http://127.0.0.1:9124/v1",
+            "quick_model": "new-fast", "deep_model": "new-deep", "api_key": "replacement-key",
+        })
+        self.assertTrue(replaced.json()["has_api_key"])
+        self.assertEqual(self.service._secret_store.get_secret(profile_id), "replacement-key")
+        self.assertNotIn("replacement-key", replaced.text)
+
+        cleared = self.client.put(f"/api/endpoints/{profile_id}", json={
+            "name": "Renamed gateway", "base_url": "http://127.0.0.1:9124/v1",
+            "quick_model": "new-fast", "deep_model": "new-deep", "clear_api_key": True,
+        })
+        self.assertFalse(cleared.json()["has_api_key"])
+        self.assertIsNone(self.service._secret_store.get_secret(profile_id))
+
+        deleted = self.client.delete(f"/api/endpoints/{profile_id}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.client.get("/api/endpoints").json(), [])
+
+    def test_saved_endpoint_probe_uses_keychain_key_without_returning_it(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        observed_auth = []
+
+        class ModelsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                observed_auth.append(self.headers.get("Authorization"))
+                self.send_response(200 if self.path == "/v1/models" else 404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"data":[]}')
+
+            def log_message(self, format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ModelsHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            created = self.client.post("/api/endpoints", json={
+                "name": "Probe profile",
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "quick_model": "fast", "deep_model": "deep", "api_key": "probe-profile-secret",
+            })
+            self.assertEqual(created.status_code, 201)
+            response = self.client.post("/api/test-endpoint", json={
+                "provider": "openai_compatible", "saved_endpoint_id": created.json()["id"],
+                "backend_url": "http://127.0.0.1:1/credential-capture",
+            })
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertEqual(observed_auth, ["Bearer probe-profile-secret"])
+        self.assertNotIn("probe-profile-secret", response.text)
 
     def test_endpoint_test_probes_selected_local_compatible_server(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

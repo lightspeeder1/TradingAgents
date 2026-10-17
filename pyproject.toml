@@ -41,6 +41,7 @@ bedrock = [
 web = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
+    "keyring>=25.0",
 ]
 
 [project.scripts]
