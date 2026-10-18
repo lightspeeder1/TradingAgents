@@ -1,7 +1,7 @@
 import json
 import os
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -232,6 +232,242 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="updateEndpointButton"', response.text)
         self.assertIn('id="deleteEndpointButton"', response.text)
         self.assertIn(".secondary:disabled{opacity:.55;cursor:not-allowed}", response.text)
+        self.assertIn('id="reportsNav"', response.text)
+        self.assertIn('id="reportsOverlay"', response.text)
+        self.assertIn('id="activityItems"', response.text)
+        self.assertIn("Live activity", response.text)
+        self.assertIn("after_id=", response.text)
+        self.assertIn("live report draft", response.text)
+        self.assertIn('id="schedulesOverlay"', response.text)
+
+    def test_run_activity_endpoint_returns_ordered_events_without_payloads(self):
+        run = self.service.submit(RunRequest(
+            ticker="AMD", analysis_date=date.today().isoformat(), provider="ollama",
+            quick_model="local", deep_model="local", analysts=["market"],
+        ))
+        self.service.record_activity(run["id"], "Running node: Market Analyst", "node_start")
+        self.service.record_activity(run["id"], "Market Analyst finished", "node_complete")
+        response = self.client.get(f"/api/runs/{run['id']}/activity?after_id=0")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual([item["message"] for item in body["items"]], [
+            "Queued; waiting for the serial analysis worker.",
+            "Running node: Market Analyst", "Market Analyst finished",
+        ])
+        self.assertEqual(body["latest_id"], body["items"][-1]["id"])
+        self.assertNotIn("payload", body["items"][0])
+        self.assertEqual(self.client.get("/api/runs/missing/activity").status_code, 404)
+
+    def test_schedule_crud_and_run_now_preserve_credentials_and_recurrence(self):
+        run_request = {
+            "ticker": "AMD", "analysis_date": date.today().isoformat(),
+            "analysts": ["market"], "provider": "ollama",
+            "quick_model": "local", "deep_model": "local",
+            "backend_url": "http://127.0.0.1:11434/v1",
+        }
+        payload = {
+            "name": "Weekday open", "cadence": "daily", "local_time": "09:30",
+            "timezone": "America/Los_Angeles", "weekday": None, "enabled": True,
+            "run_request": run_request,
+        }
+        created = self.client.post("/api/schedules", json=payload)
+        self.assertEqual(created.status_code, 201, created.text)
+        schedule = created.json()
+        self.assertEqual(schedule["name"], "Weekday open")
+        self.assertTrue(schedule["enabled"])
+        self.assertNotIn("run_request", schedule)
+        self.assertNotIn("backend_url", schedule)
+        details = self.client.get(f"/api/schedules/{schedule['id']}").json()
+        self.assertEqual(details["run_request"]["ticker"], "AMD")
+        self.assertNotIn("credential", details["run_request"])
+        self.assertTrue(schedule["next_run_at"])
+        self.assertEqual(self.client.get("/api/schedules").json()[0]["id"], schedule["id"])
+
+        payload.update({"name": "Weekly open", "cadence": "weekly", "weekday": 0, "local_time": "10:15"})
+        updated = self.client.put(f"/api/schedules/{schedule['id']}", json=payload)
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["cadence"], "weekly")
+        self.assertEqual(updated.json()["weekday"], 0)
+
+        paused = self.client.post(f"/api/schedules/{schedule['id']}/pause")
+        self.assertFalse(paused.json()["enabled"])
+        resumed = self.client.post(f"/api/schedules/{schedule['id']}/resume")
+        self.assertTrue(resumed.json()["enabled"])
+
+        queued = self.client.post(f"/api/schedules/{schedule['id']}/run-now")
+        self.assertEqual(queued.status_code, 202, queued.text)
+        self.assertEqual(queued.json()["ticker"], "AMD")
+        self.assertEqual(self.client.get("/api/schedules").json()[0]["last_run_id"], queued.json()["id"])
+        self.assertEqual(self.client.delete(f"/api/schedules/{schedule['id']}").status_code, 200)
+        self.assertEqual(self.client.get("/api/schedules").json(), [])
+
+    def test_startup_auto_resumes_checkpointed_crash_once(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "runs.sqlite3"
+            first = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            original = first.submit(RunRequest(
+                ticker="AMD", analysis_date=date.today().isoformat(), provider="ollama",
+                backend_url="http://127.0.0.1:11434/v1", quick_model="local", deep_model="local",
+                analysts=["market"], checkpoint=True,
+            ))
+            first._update(original["id"], status="running")
+            first.close()
+
+            with patch("webapp.service.checkpoint_step", return_value=4):
+                recovered = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            try:
+                old = recovered.get(original["id"])
+                self.assertEqual(old["status"], "interrupted")
+                runs = recovered.list()
+                candidates = [run for run in runs if run["id"] != original["id"]]
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["status"], "queued")
+                self.assertEqual(candidates[0]["recovery_of"], original["id"])
+                self.assertEqual(candidates[0]["auto_resume_count"], 1)
+            finally:
+                recovered.close()
+
+    def test_auto_resume_chain_stops_after_one_automatic_recovery(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "runs.sqlite3"
+            first = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            original = first.submit(RunRequest(
+                ticker="AMD", analysis_date=date.today().isoformat(), provider="ollama",
+                backend_url="http://127.0.0.1:11434/v1", quick_model="local", deep_model="local",
+                analysts=["market"], checkpoint=True,
+            ))
+            first._update(original["id"], status="running")
+            first.close()
+            with patch("webapp.service.checkpoint_step", return_value=4):
+                second = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            recovered_id = next(run["id"] for run in second.list() if run["id"] != original["id"])
+            second._update(recovered_id, status="running")
+            second.close()
+            with patch("webapp.service.checkpoint_step", return_value=8):
+                third = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            try:
+                self.assertEqual(len(third.list()), 2)
+                self.assertEqual(third.get(recovered_id)["status"], "interrupted")
+            finally:
+                third.close()
+
+    def test_startup_skips_auto_resume_if_environment_key_was_lost(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "runs.sqlite3"
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "restart-key"}):
+                first = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+                original = first.submit(RunRequest(
+                    ticker="AMD", analysis_date=date.today().isoformat(), provider="openrouter",
+                    quick_model="fast", deep_model="deep", analysts=["market"], checkpoint=True,
+                ))
+                first._update(original["id"], status="running")
+                first.close()
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}):
+                with patch("webapp.service.checkpoint_step", return_value=4):
+                    recovered = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            try:
+                self.assertEqual(len(recovered.list()), 1)
+                self.assertEqual(recovered.get(original["id"])["status"], "interrupted")
+                with recovered._db_lock:
+                    row = recovered._conn.execute(
+                        "SELECT environment_credential FROM runs WHERE id=?", (original["id"],)
+                    ).fetchone()
+                self.assertEqual(row["environment_credential"], 1)
+            finally:
+                recovered.close()
+
+    def test_startup_does_not_persist_or_auto_resume_transient_credentials(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "runs.sqlite3"
+            first = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            original = first.submit(RunRequest(
+                ticker="AMD", analysis_date=date.today().isoformat(), provider="openai",
+                quick_model="fast", deep_model="deep", analysts=["market"],
+                credential="temporary-only", checkpoint=True,
+            ))
+            first._update(original["id"], status="running")
+            first.close()
+            with patch("webapp.service.checkpoint_step", return_value=4):
+                recovered = JobService(start_worker=False, db_path=database, secret_store=MemorySecretStore())
+            try:
+                self.assertEqual(recovered.list(), [recovered.get(original["id"])])
+                self.assertEqual(recovered.get(original["id"])["status"], "interrupted")
+                with recovered._db_lock:
+                    stored = recovered._conn.execute("SELECT request_json FROM runs WHERE id=?", (original["id"],)).fetchone()[0]
+                self.assertNotIn("temporary-only", stored)
+            finally:
+                recovered.close()
+
+    def test_scheduler_dispatches_due_occurrence_once_and_advances_it(self):
+        payload = {
+            "name": "Dispatch test", "cadence": "daily", "local_time": "09:30",
+            "timezone": "America/Los_Angeles", "weekday": None, "enabled": True,
+            "run_request": {
+                "ticker": "AMD", "analysis_date": date.today().isoformat(),
+                "analysts": ["market"], "provider": "ollama", "quick_model": "local",
+                "deep_model": "local", "backend_url": "http://127.0.0.1:11434/v1",
+            },
+        }
+        schedule = self.client.post("/api/schedules", json=payload).json()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        due = (now - timedelta(minutes=5)).isoformat(timespec="seconds")
+        with self.service._db_lock:
+            self.service._conn.execute("UPDATE schedules SET next_run_at=? WHERE id=?", (due, schedule["id"]))
+            self.service._conn.commit()
+
+        first = self.service._enqueue_due_schedules(now)
+        second = self.service._enqueue_due_schedules(now)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        updated = self.service.get_schedule(schedule["id"])
+        self.assertEqual(updated["last_run_id"], first[0])
+        self.assertGreater(datetime.fromisoformat(updated["next_run_at"]), now)
+        with self.service._db_lock:
+            occurrences = self.service._conn.execute(
+                "SELECT COUNT(*) FROM schedule_occurrences WHERE schedule_id=?", (schedule["id"],)
+            ).fetchone()[0]
+        self.assertEqual(occurrences, 1)
+
+    def test_schedule_rejects_transient_credentials_and_invalid_timezone(self):
+        payload = {
+            "name": "Unsafe", "cadence": "daily", "local_time": "09:30",
+            "timezone": "Mars/Olympus", "enabled": True,
+            "run_request": {"ticker": "AMD", "credential": "must-not-persist"},
+        }
+        response = self.client.post("/api/schedules", json=payload)
+        self.assertEqual(response.status_code, 422)
+
+    def test_reports_catalog_lists_report_state_and_safe_download(self):
+        run = self.service.submit(RunRequest(
+            ticker="MRVL", analysis_date=date.today().isoformat(), provider="openrouter"
+        ))
+        with TemporaryDirectory() as directory:
+            report_path = Path(directory) / "draft.md"
+            report_path.write_text("# Interim report\n\nWorking notes", encoding="utf-8")
+            self.service._update(run["id"], status="failed", report_path=str(report_path))
+
+            catalog = self.client.get("/api/reports?limit=10&offset=0")
+            self.assertEqual(catalog.status_code, 200)
+            body = catalog.json()
+            self.assertEqual(body["total"], 1)
+            self.assertEqual(body["items"][0]["id"], run["id"])
+            self.assertTrue(body["items"][0]["available"])
+            self.assertNotIn("report_path", body["items"][0])
+
+            download = self.client.get(f"/api/reports/{run['id']}/download")
+            self.assertEqual(download.status_code, 200)
+            self.assertEqual(download.text, "# Interim report\n\nWorking notes")
+            self.assertIn("attachment; filename=", download.headers["content-disposition"])
+
+    def test_reports_catalog_marks_missing_artifact_unavailable(self):
+        run = self.service.submit(RunRequest(
+            ticker="AMD", analysis_date=date.today().isoformat(), provider="openrouter"
+        ))
+        self.service._update(run["id"], status="failed", report_path="/missing/report.md")
+        response = self.client.get("/api/reports")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["items"][0]["available"])
+        self.assertEqual(self.client.get(f"/api/reports/{run['id']}/download").status_code, 404)
 
     def test_saved_endpoint_rejects_url_credentials(self):
         response = self.client.post("/api/endpoints", json={
@@ -469,13 +705,15 @@ class ApiTests(unittest.TestCase):
                 return None
 
             def get_graph_args(self):
-                return {}
+                return {"stream_mode": "values"}
 
             def checkpoint_input(self, state):
                 return state
 
-            def stream(self, *_args, **_kwargs):
-                yield {
+            def stream(self, *_args, **kwargs):
+                FakeGraph.requested_stream_mode = kwargs.get("stream_mode")
+                yield ("debug", {"type": "task", "payload": {"name": "research_node", "input": {"private": "must-not-log"}}})
+                yield ("values", {
                     "market_report": "market notes",
                     "sentiment_report": "sentiment notes",
                     "news_report": "news notes",
@@ -486,7 +724,8 @@ class ApiTests(unittest.TestCase):
                     "final_trade_decision": "Buy",
                     "company_of_interest": "MRVL",
                     "trade_date": "2026-10-15",
-                }
+                })
+                yield ("debug", {"type": "task_result", "payload": {"name": "research_node", "result": {"private": "must-not-log"}}})
 
             def save_reports(self, _state, _ticker, save_path):
                 path = Path(save_path) / "complete_report.md"
@@ -530,6 +769,11 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(finished["status"], "completed")
                 self.assertTrue(finished["report_available"])
                 self.assertEqual(service.report(submitted["id"]), "test report")
+                self.assertEqual(set(FakeGraph.requested_stream_mode), {"values", "debug"})
+                activity = service.list_activity(submitted["id"])["items"]
+                self.assertIn("Running graph step: research node.", [item["message"] for item in activity])
+                self.assertIn("Finished graph step: research node.", [item["message"] for item in activity])
+                self.assertNotIn("must-not-log", str(activity))
                 self.assertNotIn(secret, service._request_json(submitted["id"]))
                 self.assertNotIn(submitted["id"], service._credentials)
             finally:

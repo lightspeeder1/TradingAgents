@@ -21,12 +21,15 @@ Set provider credentials in the repository `.env` (or environment) before starti
 - A “Test endpoint” check that queries the selected provider’s model-list endpoint without sending a model prompt or consuming generation tokens; local/custom URLs are checked through the OpenAI-compatible API.
 - Saved custom OpenAI-compatible endpoint profiles with create/update/delete controls; profile metadata is stored in SQLite and API keys use the operating-system keyring, with a fail-closed check against insecure keyring backends.
 - SQLite-backed run history at `~/.tradingagents/web/runs.sqlite3`.
-- One background worker and polling progress updates.
+- One background worker with polling progress and a live, payload-free activity feed from LangGraph node events.
+- A Reports catalog with filtering, pagination, in-browser viewing, and safe downloads for run-linked reports and interim drafts.
+- Local-time daily/weekly Schedules with explicit IANA timezone, pause/resume, edit/delete, and run-now; schedules are never created automatically.
+- Bounded restart recovery: checkpoint-enabled runs can be auto-resumed once after a process restart when required credentials are available. Transient credentials are not persisted or reused.
 - LangGraph checkpointing by default; the engine clears a checkpoint after a successful run.
 - Incremental Markdown report output at `~/.tradingagents/logs/web_runs/<run-id>/`.
 - Existing engine artifacts and decision memory continue to use the normal `~/.tradingagents` locations.
 
-Server restarts mark queued/running jobs as interrupted. For checkpoint-enabled failed or interrupted runs, use **Resume** in the history row; it creates a new run with the original settings and continues from the engine checkpoint if one is available (otherwise it starts from the beginning). Re-enter the provider credential if needed because credentials are transient. **Delete** removes only the history record; report files and checkpoints are left on disk. Active queued/running jobs cannot be deleted from history.
+On process restart, queued/running jobs are marked interrupted. Checkpoint-enabled running jobs are automatically re-queued at most once per recovery chain when the checkpoint and required saved/environment credentials are available. A transient API key is never written to disk; if a run used one, it is left interrupted and must be resumed manually with a newly entered key. Runs already in progress when upgrading to credential-provenance tracking are conservatively left interrupted once, because the app cannot reliably know whether their credentials were typed temporarily. Queued work with unavailable credentials is also left interrupted. A worker-thread exit is supervised and persisted work is recovered; a still-alive but blocked provider request is not forcibly killed. The dashboard's Live activity shows actual LangGraph step start/completion events, not source code or internal payloads. Reports are refreshed after graph state updates; model responses themselves are not streamed token-by-token, so report text may arrive in chunks rather than line-by-line. **Delete** removes only the history record; report files and checkpoints are left on disk. Active queued/running jobs cannot be deleted from history.
 
 ## Verification
 

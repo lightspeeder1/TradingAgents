@@ -18,7 +18,7 @@ from tradingagents.llm_clients.openai_client import OPENAI_COMPATIBLE_PROVIDERS
 
 from .secure_store import SecretStoreError
 from .service import (
-    JobService, RunRequest, SavedEndpointRequest,
+    JobService, RunRequest, SavedEndpointRequest, ScheduleRequest,
     configured_default_models, configured_default_provider,
 )
 
@@ -248,6 +248,89 @@ def create_app(service: JobService | None = None) -> FastAPI:
         except SecretStoreError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    @app.get("/api/schedules")
+    def list_schedules():
+        return get_jobs().list_schedules()
+
+    @app.post("/api/schedules", status_code=201)
+    def create_schedule(request: ScheduleRequest):
+        try:
+            return get_jobs().create_schedule(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/schedules/{schedule_id}")
+    def get_schedule(schedule_id: str):
+        result = get_jobs().get_schedule_detail(schedule_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        return result
+
+    @app.put("/api/schedules/{schedule_id}")
+    def update_schedule(schedule_id: str, request: ScheduleRequest):
+        try:
+            result = get_jobs().update_schedule(schedule_id, request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        return result
+
+    @app.post("/api/schedules/{schedule_id}/pause")
+    def pause_schedule(schedule_id: str):
+        result = get_jobs().set_schedule_enabled(schedule_id, False)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        return result
+
+    @app.post("/api/schedules/{schedule_id}/resume")
+    def resume_schedule(schedule_id: str):
+        try:
+            result = get_jobs().set_schedule_enabled(schedule_id, True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        return result
+
+    @app.post("/api/schedules/{schedule_id}/run-now", status_code=202)
+    def run_schedule_now(schedule_id: str):
+        try:
+            result = get_jobs().run_schedule_now(schedule_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except SecretStoreError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        return result
+
+    @app.delete("/api/schedules/{schedule_id}")
+    def delete_schedule(schedule_id: str):
+        if not get_jobs().delete_schedule(schedule_id):
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        return {"deleted": schedule_id}
+
+    @app.get("/api/reports")
+    def list_reports(
+        limit: int = 50, offset: int = 0,
+        ticker: str | None = None, status: str | None = None,
+    ):
+        if not 1 <= limit <= 200 or offset < 0:
+            raise HTTPException(status_code=422, detail="Report limit must be 1–200 and offset must be non-negative.")
+        return get_jobs().list_reports(limit=limit, offset=offset, ticker=ticker, status=status)
+
+    @app.get("/api/reports/{job_id}/download", response_class=PlainTextResponse)
+    def download_report(job_id: str):
+        content = get_jobs().report(job_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail="Report is not available.")
+        safe_id = "".join(character for character in job_id if character.isalnum() or character in "-_")[:40]
+        return PlainTextResponse(
+            content,
+            headers={"Content-Disposition": f'attachment; filename="report-{safe_id or "download"}.md"'},
+        )
+
     @app.get("/api/runs")
     def list_runs():
         return get_jobs().list()
@@ -287,6 +370,15 @@ def create_app(service: JobService | None = None) -> FastAPI:
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         return run
+
+    @app.get("/api/runs/{job_id}/activity")
+    def get_run_activity(job_id: str, after_id: int = 0, limit: int = 100):
+        if after_id < 0 or not 1 <= limit <= 200:
+            raise HTTPException(status_code=422, detail="after_id must be non-negative and limit must be 1–200.")
+        result = get_jobs().list_activity(job_id, after_id=after_id, limit=limit)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return result
 
     @app.get("/api/runs/{job_id}/report", response_class=PlainTextResponse)
     def get_report(job_id: str):

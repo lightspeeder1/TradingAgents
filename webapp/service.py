@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, SecretStr
 
@@ -18,6 +21,7 @@ from cli.models import AnalystType
 from cli.prompts import detect_asset_type, normalize_ticker_symbol, is_valid_ticker_input
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.graph.checkpointer import checkpoint_step
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
 from tradingagents.dataflows.config import run_config
 
@@ -69,6 +73,58 @@ class SavedEndpointRequest(BaseModel):
     deep_model: str
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     clear_api_key: bool = False
+
+
+class ScheduleRequest(BaseModel):
+    name: str
+    cadence: Literal["daily", "weekly"]
+    local_time: str
+    timezone: str
+    weekday: int | None = None
+    enabled: bool = True
+    run_request: RunRequest
+
+
+def next_schedule_time(
+    cadence: str, local_time: str, timezone_name: str, weekday: int | None = None,
+    after: datetime | None = None,
+) -> datetime:
+    """Return the next local wall-clock occurrence as an aware UTC datetime."""
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", local_time):
+        raise ValueError("Schedule time must use 24-hour HH:MM format.")
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("Choose a valid IANA timezone, such as America/New_York.") from exc
+    if cadence not in {"daily", "weekly"}:
+        raise ValueError("Schedule cadence must be daily or weekly.")
+    if cadence == "weekly" and (weekday is None or not 0 <= weekday <= 6):
+        raise ValueError("Weekly schedules require a weekday from 0 (Monday) to 6 (Sunday).")
+    if cadence == "daily" and weekday is not None:
+        raise ValueError("Daily schedules do not use a weekday.")
+    now = (after or datetime.now(timezone.utc)).astimezone(zone)
+    hour, minute = map(int, local_time.split(":"))
+    day = now.date()
+    if cadence == "weekly":
+        day += timedelta(days=(weekday - day.weekday()) % 7)
+    candidate = datetime.combine(day, time(hour, minute), tzinfo=zone)
+    if candidate <= now:
+        candidate += timedelta(days=7 if cadence == "weekly" else 1)
+    # ZoneInfo uses fold=0 for repeated fall-back times; nonexistent spring-forward
+    # wall times normalize forward when round-tripped through UTC.
+    return candidate.astimezone(timezone.utc)
+
+
+def validate_schedule_request(request: ScheduleRequest) -> ScheduleRequest:
+    name = request.name.strip()
+    if not name or len(name) > 80:
+        raise ValueError("Schedule name must contain 1–80 characters.")
+    next_schedule_time(request.cadence, request.local_time, request.timezone, request.weekday)
+    run_request = request.run_request
+    if run_request.credential and run_request.credential.get_secret_value():
+        raise ValueError("Transient API credentials cannot be saved in a schedule. Use a saved endpoint profile or environment credentials.")
+    run_request = validate_run_request(run_request.model_copy(update={"credential": None}))
+    return request.model_copy(update={"name": name, "run_request": run_request})
 
 
 def _validate_base_url(value: str) -> str:
@@ -157,33 +213,344 @@ class JobService:
         self._conn.execute("""CREATE TABLE IF NOT EXISTS runs (
             id TEXT PRIMARY KEY, ticker TEXT NOT NULL, analysis_date TEXT NOT NULL,
             status TEXT NOT NULL, request_json TEXT NOT NULL, progress_json TEXT NOT NULL,
-            report_path TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            report_path TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            auto_resume_count INTEGER NOT NULL DEFAULT 0, recovery_of TEXT,
+            transient_credential INTEGER NOT NULL DEFAULT 0,
+            environment_credential INTEGER NOT NULL DEFAULT 0
         )""")
+        existing_run_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")}
+        # Runs created before environment credential provenance was tracked cannot be
+        # safely auto-resumed: a typed override may have been used without persistence.
+        credential_history_unknown = "environment_credential" not in existing_run_columns
+        for column, declaration in (
+            ("auto_resume_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("recovery_of", "TEXT"),
+            ("transient_credential", "INTEGER NOT NULL DEFAULT 0"),
+            ("environment_credential", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in existing_run_columns:
+                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {declaration}")
         self._conn.execute("""CREATE TABLE IF NOT EXISTS saved_endpoints (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL,
             quick_model TEXT NOT NULL, deep_model TEXT NOT NULL,
             has_api_key INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         )""")
-        self._conn.execute(
-            "UPDATE runs SET status='interrupted', error='Server restarted before this run completed', updated_at=? WHERE status IN ('queued','running')",
-            (datetime.now().isoformat(timespec="seconds"),),
-        )
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS schedules (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, cadence TEXT NOT NULL,
+            local_time TEXT NOT NULL, timezone TEXT NOT NULL, weekday INTEGER,
+            enabled INTEGER NOT NULL, run_request_json TEXT NOT NULL,
+            next_run_at TEXT, last_run_id TEXT, last_error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS schedule_occurrences (
+            schedule_id TEXT NOT NULL, scheduled_for TEXT NOT NULL,
+            run_id TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (schedule_id, scheduled_for)
+        )""")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS run_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+            created_at TEXT NOT NULL, event_type TEXT NOT NULL, message TEXT NOT NULL
+        )""")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_run_events_run_id_id ON run_events(run_id,id)")
+        if credential_history_unknown:
+            self._conn.execute(
+                "UPDATE runs SET transient_credential=1 WHERE status IN ('queued','running')"
+            )
         self._conn.commit()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._closed = False
         self._worker: threading.Thread | None = None
+        self._dispatch_lock = threading.Lock()
+        self._scheduler_stop = threading.Event()
+        self._scheduler_thread: threading.Thread | None = None
+        pending_recovered_jobs = self._recover_startup_runs()
         if start_worker:
             self._worker = threading.Thread(target=self._worker_loop, name="ta-web-worker", daemon=True)
             self._worker.start()
+            for job_id in pending_recovered_jobs:
+                self._queue.put(job_id)
+            self._scheduler_thread = threading.Thread(target=self._scheduler_loop, name="ta-web-scheduler", daemon=True)
+            self._scheduler_thread.start()
+
+    def _recover_startup_runs(self) -> list[str]:
+        """Recover queued work and create at most one checkpoint-based retry per run."""
+        pending: list[str] = []
+        with self._db_lock:
+            stale = self._conn.execute(
+                "SELECT * FROM runs WHERE status IN ('queued','running') ORDER BY created_at"
+            ).fetchall()
+        for row in stale:
+            request = RunRequest.model_validate_json(row["request_json"])
+            credential_env = "AWS_BEARER_TOKEN_BEDROCK" if request.provider == "bedrock" else PROVIDER_API_KEY_ENV.get(request.provider)
+            environment_credential_lost = bool(
+                row["environment_credential"] and credential_env and not os.environ.get(credential_env)
+            )
+            credentials_available = not environment_credential_lost and self._recovery_credentials_available(request)
+            if row["status"] == "queued" and not row["transient_credential"] and credentials_available:
+                pending.append(row["id"])
+                continue
+            now = datetime.now().isoformat(timespec="seconds")
+            error = "Server restarted before this run completed"
+            if row["status"] == "queued" and row["transient_credential"]:
+                error += "; its transient credential was lost, so enter it again before resuming"
+            elif row["status"] == "queued" and not credentials_available:
+                error += "; required provider credentials are unavailable, so submit it again after restoring them"
+            with self._db_lock:
+                self._conn.execute(
+                    "UPDATE runs SET status='interrupted',error=?,updated_at=? WHERE id=?",
+                    (error, now, row["id"]),
+                )
+                self._conn.commit()
+            if row["status"] != "running" or not request.checkpoint:
+                continue
+            if row["auto_resume_count"] >= 1 or row["transient_credential"] or not credentials_available:
+                continue
+            asset_type = detect_asset_type(request.ticker).value
+            signature = "|".join([
+                "analysts=" + ",".join(request.analysts),
+                f"debate={request.debate_rounds}", f"risk={request.risk_rounds}",
+                f"asset={asset_type}", "portfolio=none",
+            ])
+            try:
+                step = checkpoint_step(DEFAULT_CONFIG["data_cache_dir"], request.ticker, request.analysis_date, signature)
+            except Exception:
+                logging.getLogger(__name__).exception("Could not inspect checkpoint for run %s", row["id"])
+                continue
+            if step is None:
+                continue
+            job_id = uuid.uuid4().hex
+            progress = json.loads(row["progress_json"])
+            progress["stage"] = "Auto-resuming from saved checkpoint"
+            with self._db_lock:
+                self._conn.execute(
+                    "INSERT INTO runs (id,ticker,analysis_date,status,request_json,progress_json,created_at,updated_at,auto_resume_count,recovery_of,transient_credential,environment_credential) VALUES (?,?,?,?,?,?,?,?,?,?,0,?)",
+                    (job_id, row["ticker"], row["analysis_date"], "queued", row["request_json"],
+                     json.dumps(progress), now, now, row["auto_resume_count"] + 1, row["id"], row["environment_credential"]),
+                )
+                self._conn.commit()
+            pending.append(job_id)
+        return pending
+
+    def _recovery_credentials_available(self, request: RunRequest) -> bool:
+        if request.saved_endpoint_id:
+            try:
+                profile = self.get_saved_endpoint(request.saved_endpoint_id)
+                if profile is None:
+                    return False
+                if profile["has_api_key"]:
+                    return bool(self.get_saved_endpoint_secret(request.saved_endpoint_id))
+                return True
+            except (KeyError, SecretStoreError):
+                return False
+        credential_env = "AWS_BEARER_TOKEN_BEDROCK" if request.provider == "bedrock" else PROVIDER_API_KEY_ENV.get(request.provider)
+        if credential_env and os.environ.get(credential_env):
+            return True
+        if credential_env and request.provider not in {"openai_compatible", "bedrock"}:
+            return False
+        return True
+
+    def _scheduler_loop(self) -> None:
+        while not self._scheduler_stop.wait(5):
+            try:
+                self._restart_worker_if_dead()
+                self._enqueue_due_schedules()
+            except Exception:
+                logging.getLogger(__name__).exception("Schedule/worker supervision failed")
+
+    def _restart_worker_if_dead(self) -> bool:
+        if self._closed or self._worker is None or self._worker.is_alive():
+            return False
+        logging.getLogger(__name__).error("Analysis worker exited unexpectedly; recovering persisted queue")
+        while True:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                break
+        pending = self._recover_startup_runs()
+        self._worker = threading.Thread(target=self._worker_loop, name="ta-web-worker-restarted", daemon=True)
+        self._worker.start()
+        for job_id in pending:
+            self._queue.put(job_id)
+        return True
+
+    def _enqueue_due_schedules(self, now: datetime | None = None) -> list[str]:
+        """Enqueue due schedules once; missed occurrences older than 15 minutes are skipped."""
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+        now_text = now.isoformat(timespec="seconds")
+        created_runs: list[str] = []
+        with self._dispatch_lock:
+            with self._db_lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM schedules WHERE enabled=1 AND next_run_at IS NOT NULL AND next_run_at<=? ORDER BY next_run_at",
+                    (now_text,),
+                ).fetchall()
+            for row in rows:
+                scheduled_for = row["next_run_at"]
+                scheduled_at = datetime.fromisoformat(scheduled_for).astimezone(timezone.utc)
+                next_run = next_schedule_time(
+                    row["cadence"], row["local_time"], row["timezone"], row["weekday"], now
+                )
+                if now - scheduled_at > timedelta(minutes=15):
+                    with self._db_lock:
+                        self._conn.execute(
+                            "UPDATE schedules SET next_run_at=?,last_error=?,updated_at=? WHERE id=? AND next_run_at=?",
+                            (next_run.isoformat(timespec="seconds"), "Skipped missed occurrence (more than 15 minutes late)", now_text, row["id"], scheduled_for),
+                        )
+                        self._conn.commit()
+                    continue
+                try:
+                    request = RunRequest.model_validate_json(row["run_request_json"])
+                    request = request.model_copy(update={
+                        "analysis_date": now.astimezone(ZoneInfo(row["timezone"])).date().isoformat()
+                    })
+                    run = self.submit(request)
+                    with self._db_lock:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO schedule_occurrences (schedule_id,scheduled_for,run_id,created_at) VALUES (?,?,?,?)",
+                            (row["id"], scheduled_for, run["id"], now_text),
+                        )
+                        self._conn.execute(
+                            "UPDATE schedules SET next_run_at=?,last_run_id=?,last_error=NULL,updated_at=? WHERE id=? AND next_run_at=? AND enabled=1",
+                            (next_run.isoformat(timespec="seconds"), run["id"], now_text, row["id"], scheduled_for),
+                        )
+                        self._conn.commit()
+                    created_runs.append(run["id"])
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("Could not dispatch schedule %s", row["id"])
+                    with self._db_lock:
+                        self._conn.execute(
+                            "UPDATE schedules SET next_run_at=?,last_error=?,updated_at=? WHERE id=? AND next_run_at=?",
+                            (next_run.isoformat(timespec="seconds"), f"{type(exc).__name__}: {exc}"[:500], now_text, row["id"], scheduled_for),
+                        )
+                        self._conn.commit()
+        return created_runs
+
+    def create_schedule(self, request: ScheduleRequest) -> dict[str, Any]:
+        request = validate_schedule_request(request)
+        schedule_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc)
+        next_run = (
+            next_schedule_time(request.cadence, request.local_time, request.timezone, request.weekday, now)
+            if request.enabled else None
+        )
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT INTO schedules (id,name,cadence,local_time,timezone,weekday,enabled,run_request_json,next_run_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (schedule_id, request.name, request.cadence, request.local_time, request.timezone,
+                 request.weekday, int(request.enabled), request.run_request.model_dump_json(),
+                 next_run.isoformat(timespec="seconds") if next_run else None,
+                 now.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
+            )
+            self._conn.commit()
+        return self.get_schedule(schedule_id)
+
+    def list_schedules(self) -> list[dict[str, Any]]:
+        with self._db_lock:
+            rows = self._conn.execute("SELECT * FROM schedules ORDER BY enabled DESC,next_run_at,name COLLATE NOCASE").fetchall()
+        return [self._serialize_schedule(row) for row in rows]
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any] | None:
+        with self._db_lock:
+            row = self._conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        return self._serialize_schedule(row) if row else None
+
+    def get_schedule_detail(self, schedule_id: str) -> dict[str, Any] | None:
+        with self._db_lock:
+            row = self._conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        if row is None:
+            return None
+        result = self._serialize_schedule(row)
+        result["run_request"] = json.loads(row["run_request_json"])
+        return result
+
+    @staticmethod
+    def _serialize_schedule(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"], "name": row["name"], "cadence": row["cadence"],
+            "local_time": row["local_time"], "timezone": row["timezone"],
+            "weekday": row["weekday"], "enabled": bool(row["enabled"]),
+            "next_run_at": row["next_run_at"], "last_run_id": row["last_run_id"],
+            "last_error": row["last_error"], "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def update_schedule(self, schedule_id: str, request: ScheduleRequest) -> dict[str, Any] | None:
+        request = validate_schedule_request(request)
+        now = datetime.now(timezone.utc)
+        next_run = (
+            next_schedule_time(request.cadence, request.local_time, request.timezone, request.weekday, now)
+            if request.enabled else None
+        )
+        with self._db_lock:
+            cursor = self._conn.execute(
+                "UPDATE schedules SET name=?,cadence=?,local_time=?,timezone=?,weekday=?,enabled=?,run_request_json=?,next_run_at=?,last_error=NULL,updated_at=? WHERE id=?",
+                (request.name, request.cadence, request.local_time, request.timezone,
+                 request.weekday, int(request.enabled), request.run_request.model_dump_json(),
+                 next_run.isoformat(timespec="seconds") if next_run else None,
+                 now.isoformat(timespec="seconds"), schedule_id),
+            )
+            self._conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_schedule(schedule_id)
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> dict[str, Any] | None:
+        now = datetime.now(timezone.utc)
+        with self._db_lock:
+            row = self._conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+            if row is None:
+                return None
+            next_run = None
+            if enabled:
+                next_run = next_schedule_time(row["cadence"], row["local_time"], row["timezone"], row["weekday"], now)
+            self._conn.execute(
+                "UPDATE schedules SET enabled=?,next_run_at=?,last_error=NULL,updated_at=? WHERE id=?",
+                (int(enabled), next_run.isoformat(timespec="seconds") if next_run else None,
+                 now.isoformat(timespec="seconds"), schedule_id),
+            )
+            self._conn.commit()
+        return self.get_schedule(schedule_id)
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._db_lock:
+            cursor = self._conn.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+            self._conn.execute("DELETE FROM schedule_occurrences WHERE schedule_id=?", (schedule_id,))
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def run_schedule_now(self, schedule_id: str) -> dict[str, Any] | None:
+        with self._db_lock:
+            row = self._conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        if row is None:
+            return None
+        request = RunRequest.model_validate_json(row["run_request_json"])
+        request = request.model_copy(update={
+            "analysis_date": datetime.now(ZoneInfo(row["timezone"])).date().isoformat()
+        })
+        run = self.submit(request)
+        with self._db_lock:
+            self._conn.execute(
+                "UPDATE schedules SET last_run_id=?,last_error=NULL,updated_at=? WHERE id=?",
+                (run["id"], datetime.now().isoformat(timespec="seconds"), schedule_id),
+            )
+            self._conn.commit()
+        return run
 
     def submit(self, request: RunRequest) -> dict[str, Any]:
+        user_supplied_secret = bool(request.credential and request.credential.get_secret_value())
+        saved_profile_has_key = False
         if request.saved_endpoint_id:
             if request.provider.strip().lower() != "openai_compatible":
                 raise ValueError("Saved custom endpoint profiles require the OpenAI-compatible provider.")
             profile = self.get_saved_endpoint(request.saved_endpoint_id)
             if profile is None:
                 raise ValueError("Saved endpoint profile was not found; refresh the endpoint list.")
+            saved_profile_has_key = bool(profile["has_api_key"])
             request = request.model_copy(update={"backend_url": profile["base_url"]})
             provided_secret = (
                 request.credential.get_secret_value()
@@ -198,18 +565,24 @@ class JobService:
         credential_env = "AWS_BEARER_TOKEN_BEDROCK" if request.provider == "bedrock" else PROVIDER_API_KEY_ENV.get(request.provider)
         if secret and not credential_env:
             raise ValueError(f"Provider '{request.provider}' does not accept a credential in this field.")
+        transient_credential = user_supplied_secret
+        environment_credential = bool(
+            credential_env and os.environ.get(credential_env)
+            and not user_supplied_secret and not saved_profile_has_key
+        )
         job_id = uuid.uuid4().hex
         now = datetime.now().isoformat(timespec="seconds")
         initial_progress = {"stage": "Queued", "percent": 0, "completed_analysts": []}
         with self._db_lock:
             self._conn.execute(
-                "INSERT INTO runs (id,ticker,analysis_date,status,request_json,progress_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                (job_id, request.ticker, request.analysis_date, "queued", request.model_dump_json(), json.dumps(initial_progress), now, now),
+                "INSERT INTO runs (id,ticker,analysis_date,status,request_json,progress_json,created_at,updated_at,transient_credential,environment_credential) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (job_id, request.ticker, request.analysis_date, "queued", request.model_dump_json(), json.dumps(initial_progress), now, now, int(transient_credential), int(environment_credential)),
             )
             self._conn.commit()
         if secret and credential_env:
             with self._credential_lock:
                 self._credentials[job_id] = (credential_env, secret)
+        self.record_activity(job_id, "Queued; waiting for the serial analysis worker.", "queued")
         if self._worker:
             self._queue.put(job_id)
         job = self.get(job_id)
@@ -347,6 +720,7 @@ class JobService:
                 raise KeyError(job_id)
             if row["status"] in {"queued", "running"}:
                 raise ValueError("Cannot delete a queued or running analysis.")
+            self._conn.execute("DELETE FROM run_events WHERE run_id=?", (job_id,))
             self._conn.execute("DELETE FROM runs WHERE id=?", (job_id,))
             self._conn.commit()
         return {"deleted": job_id}
@@ -356,10 +730,70 @@ class JobService:
             row = self._conn.execute("SELECT * FROM runs WHERE id=?", (job_id,)).fetchone()
         return self._serialize(row) if row else None
 
+    def record_activity(self, job_id: str, message: str, event_type: str = "info") -> int | None:
+        message = " ".join(str(message).split())[:500]
+        event_type = "".join(character for character in str(event_type) if character.isalnum() or character in "_-")[:32] or "info"
+        with self._db_lock:
+            exists = self._conn.execute("SELECT 1 FROM runs WHERE id=?", (job_id,)).fetchone()
+            if not exists:
+                return None
+            cursor = self._conn.execute(
+                "INSERT INTO run_events (run_id,created_at,event_type,message) VALUES (?,?,?,?)",
+                (job_id, datetime.now().isoformat(timespec="seconds"), event_type, message),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid)
+
+    def list_activity(self, job_id: str, after_id: int = 0, limit: int = 100) -> dict[str, Any] | None:
+        with self._db_lock:
+            exists = self._conn.execute("SELECT 1 FROM runs WHERE id=?", (job_id,)).fetchone()
+            if not exists:
+                return None
+            rows = self._conn.execute(
+                "SELECT id,created_at,event_type,message FROM run_events WHERE run_id=? AND id>? ORDER BY id LIMIT ?",
+                (job_id, after_id, limit),
+            ).fetchall()
+        items = [dict(row) for row in rows]
+        return {"items": items, "latest_id": items[-1]["id"] if items else after_id}
+
     def list(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._db_lock:
             rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [self._serialize(row) for row in rows]
+
+    def list_reports(
+        self, limit: int = 50, offset: int = 0,
+        ticker: str | None = None, status: str | None = None,
+    ) -> dict[str, Any]:
+        """List report artifacts associated with run history, without exposing paths."""
+        clauses = ["report_path IS NOT NULL"]
+        params: list[Any] = []
+        if ticker and ticker.strip():
+            clauses.append("ticker = ? COLLATE NOCASE")
+            params.append(ticker.strip())
+        if status and status.strip():
+            clauses.append("status = ?")
+            params.append(status.strip().lower())
+        where = " AND ".join(clauses)
+        with self._db_lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM runs WHERE {where}", params
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                f"SELECT id,ticker,analysis_date,status,progress_json,report_path,updated_at "
+                f"FROM runs WHERE {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        items = []
+        for row in rows:
+            report_path = Path(row["report_path"])
+            items.append({
+                "id": row["id"], "ticker": row["ticker"],
+                "analysis_date": row["analysis_date"], "status": row["status"],
+                "progress": json.loads(row["progress_json"]),
+                "available": report_path.is_file(), "updated_at": row["updated_at"],
+            })
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
 
     def report(self, job_id: str) -> str | None:
         with self._db_lock:
@@ -373,6 +807,9 @@ class JobService:
         if self._closed:
             return
         self._closed = True
+        self._scheduler_stop.set()
+        if self._scheduler_thread:
+            self._scheduler_thread.join(timeout=3)
         if self._worker:
             self._queue.put(None)
             self._worker.join(timeout=3)
@@ -394,6 +831,7 @@ class JobService:
             "report_available": bool(row["report_path"] and Path(row["report_path"]).is_file()),
             "resume_available": resume_available,
             "error": row["error"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "auto_resume_count": row["auto_resume_count"], "recovery_of": row["recovery_of"],
         }
 
     def _update(self, job_id: str, **fields: Any) -> None:
@@ -421,14 +859,24 @@ class JobService:
         request = RunRequest.model_validate_json(self._request_json(job_id))
         progress = {"stage": "Starting", "percent": 1, "completed_analysts": []}
         self._update(job_id, status="running", error=None, progress_json=progress)
+        self.record_activity(job_id, "Analysis worker started.", "started")
         with self._credential_lock:
             runtime_credential = self._credentials.pop(job_id, None)
-        credential_env = runtime_credential[0] if runtime_credential else None
+        credential_env = runtime_credential[0] if runtime_credential else (
+            "AWS_BEARER_TOKEN_BEDROCK" if request.provider == "bedrock" else PROVIDER_API_KEY_ENV.get(request.provider)
+        )
         credential_value = runtime_credential[1] if runtime_credential else None
-        previous_credential = os.environ.get(credential_env) if credential_env else None
+        previous_credential = None
+        environment_overridden = False
         try:
+            if not credential_value and request.saved_endpoint_id:
+                saved_secret = self.get_saved_endpoint_secret(request.saved_endpoint_id)
+                if saved_secret:
+                    credential_value = saved_secret
             if credential_env and credential_value:
+                previous_credential = os.environ.get(credential_env)
                 os.environ[credential_env] = credential_value
+                environment_overridden = True
             config = DEFAULT_CONFIG.copy()
             config.update({
                 "llm_provider": request.provider,
@@ -451,14 +899,25 @@ class JobService:
                 initial_state = graph.create_run_state(request.ticker, request.analysis_date, asset_type)
                 thread_id = graph.begin_checkpoint(request.ticker, request.analysis_date, asset_type)
                 args = graph.propagator.get_graph_args()
+                args["stream_mode"] = ["values", "debug"]
                 if thread_id:
                     args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = thread_id
                 try:
-                    for snapshot in graph.graph.stream(graph.checkpoint_input(initial_state), **args):
-                        latest_state = snapshot
-                        progress = self._progress_for(snapshot, request.analysts)
+                    for event in graph.graph.stream(graph.checkpoint_input(initial_state), **args):
+                        if isinstance(event, tuple) and len(event) == 2:
+                            stream_mode, chunk = event
+                        else:
+                            stream_mode, chunk = "values", event
+                        if stream_mode == "debug":
+                            self._record_graph_debug_event(job_id, chunk)
+                            continue
+                        if stream_mode != "values" or not isinstance(chunk, dict):
+                            continue
+                        latest_state = chunk
+                        progress = self._progress_for(chunk, request.analysts)
                         self._update(job_id, progress_json=progress, report_path=str(run_dir / "complete_report.md"))
-                        graph.save_reports(snapshot, request.ticker, run_dir)
+                        graph.save_reports(chunk, request.ticker, run_dir)
+                        self.record_activity(job_id, "Interim report draft refreshed after a graph step.", "report_update")
                     if not latest_state.get("final_trade_decision"):
                         raise RuntimeError("Analysis ended without a final decision.")
                     graph._log_state(request.analysis_date, latest_state)
@@ -470,6 +929,7 @@ class JobService:
             progress = self._progress_for(latest_state, request.analysts)
             progress.update({"stage": "Complete", "percent": 100})
             self._update(job_id, status="completed", progress_json=progress, report_path=str(report_file), error=None)
+            self.record_activity(job_id, "Analysis completed and report saved.", "completed")
         except Exception as exc:
             # Keep interim reports and never persist a submitted credential in errors.
             current = self.get(job_id)
@@ -479,8 +939,9 @@ class JobService:
             if credential_value:
                 error = error.replace(credential_value, "[redacted]")
             self._update(job_id, status="failed", progress_json=progress, error=error)
+            self.record_activity(job_id, "Analysis failed; see run details for the error.", "failed")
         finally:
-            if credential_env:
+            if environment_overridden and credential_env:
                 if previous_credential is None:
                     os.environ.pop(credential_env, None)
                 else:
@@ -492,6 +953,26 @@ class JobService:
         if not row:
             raise KeyError(job_id)
         return row["request_json"]
+
+    def _record_graph_debug_event(self, job_id: str, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        payload = event.get("payload") or event.get("data") or {}
+        if not isinstance(payload, dict):
+            return
+        name = " ".join(str(payload.get("name") or "graph").replace("_", " ").split())[:100]
+        if name == "start":
+            name = "analysis setup"
+        elif name == "end":
+            name = "finalization"
+        if kind == "task":
+            self.record_activity(job_id, f"Running graph step: {name}.", "node_start")
+        elif kind == "task_result":
+            if payload.get("error"):
+                self.record_activity(job_id, f"Graph step failed: {name}.", "node_failed")
+            else:
+                self.record_activity(job_id, f"Finished graph step: {name}.", "node_complete")
 
     @staticmethod
     def _progress_for(state: dict[str, Any], analysts: list[str]) -> dict[str, Any]:
