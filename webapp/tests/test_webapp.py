@@ -231,6 +231,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="saveEndpointButton"', response.text)
         self.assertIn('id="updateEndpointButton"', response.text)
         self.assertIn('id="deleteEndpointButton"', response.text)
+        self.assertIn(".secondary:disabled{opacity:.55;cursor:not-allowed}", response.text)
 
     def test_saved_endpoint_rejects_url_credentials(self):
         response = self.client.post("/api/endpoints", json={
